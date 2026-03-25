@@ -32,7 +32,7 @@ from git import Repo
 # ========================
 
 CAPTURE_INTERVAL = 10.0      # seconds between captures
-GRID_SIZE = 10               # hazard grid size
+GRID_SIZE = 50               # hazard grid size
 GRAVITY = 9.80665            # m/s^2
 
 # ---- LOCAL STORAGE ----
