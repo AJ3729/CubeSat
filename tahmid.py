@@ -3,16 +3,12 @@ CubeSat Flight Software
 
 
 Includes:
+- Mission scheduler loop
 - Periodic camera capture
 - Metadata logging
 - Hazard grid (50x50 safety map)
-- Hazard grid overlay on captured image
+- Hazard grid overlay on captured image (displayed locally + saved)
 - Optional GitHub upload
-
-
-Colour convention throughout:
- score 0  (safe)    -> SOFT GREEN
- score 10 (danger)  -> RED
 """
 
 
@@ -40,36 +36,27 @@ from git import Repo
 # ========================
 
 
-CAPTURE_INTERVAL = 10.0
-GRID_SIZE        = 50
-GRAVITY          = 9.80665
+CAPTURE_INTERVAL = 10.0      # seconds between captures
+GRID_SIZE = 50               # hazard grid size
+GRAVITY = 9.80665            # m/s^2
 
 
 # ---- LOCAL STORAGE ----
-BASE_PATH = Path("/home/palace-stuy/CubeSat")   # <-- EDIT THIS
-
-
+BASE_PATH        = Path("/home/palace-stuy/CubeSat")
 IMAGE_FOLDER     = BASE_PATH / "Images"
 DATA_FOLDER      = BASE_PATH / "Data"
 ANNOTATED_FOLDER = BASE_PATH / "Annotated"
 
 
-NAME = "TahmidI"                                # <-- EDIT THIS
+NAME = "TahmidI"
 
 
 # ---- GITHUB SETTINGS ----
-ENABLE_GITHUB_UPLOAD = True                     # <-- Set False to disable
+ENABLE_GITHUB_UPLOAD = True
 REPO_PATH            = BASE_PATH
 GITHUB_BRANCH        = "main"
 GITHUB_REMOTE_NAME   = "origin"
 COMMIT_EVERY_CAPTURE = True
-
-
-# ---- COLOUR SETTINGS ----
-# Softer safe green so it is not overly bright compared to red.
-SAFE_GREEN_MAX = 170
-
-
 
 
 # ========================
@@ -106,7 +93,7 @@ def initialize_folders() -> None:
 
 
 def initialize_sensors():
-   i2c          = board.I2C()
+   i2c = board.I2C()
    accel_gyro   = LSM6DSOX(i2c)
    magnetometer = LIS3MDL(i2c)
    print("[INIT] IMU and magnetometer initialized")
@@ -139,7 +126,7 @@ def timestamp() -> str:
 
 
 def generate_filenames() -> tuple[str, str, str]:
-   t              = timestamp()
+   t = timestamp()
    image_path     = IMAGE_FOLDER     / f"{NAME}_{t}.jpg"
    data_path      = DATA_FOLDER      / f"{NAME}_{t}.json"
    annotated_path = ANNOTATED_FOLDER / f"{NAME}_{t}_grid.jpg"
@@ -161,7 +148,7 @@ def get_acceleration(accel_gyro) -> tuple[float, float, float]:
 
 
 def get_orientation(accel_gyro, magnetometer) -> dict[str, float]:
-   ax, ay, az  = accel_gyro.acceleration
+   ax, ay, az = accel_gyro.acceleration
    mx, my, _mz = magnetometer.magnetic
 
 
@@ -198,32 +185,6 @@ def capture_image(picam2, filepath: str) -> bool:
 
 
 # ========================
-# SHARED COLOUR HELPER
-# ========================
-
-
-def score_to_bgr(score: int) -> tuple[int, int, int]:
-   """
-   Map a hazard score (0-10) to a BGR colour.
-
-
-     score  0 (safe)   -> soft green  BGR (0, 170,   0)
-     score  5 (medium) -> muted yellow/orange region
-     score 10 (danger) -> red         BGR (0,   0, 255)
-
-
-   The green channel intentionally tops out below 255 so the safe colour
-   is less neon and visually better balanced against the mellow red.
-   """
-   t     = max(0, min(10, score)) / 10.0
-   green = int(round(SAFE_GREEN_MAX * (1.0 - t)))
-   red   = int(round(255 * t))
-   return (0, green, red)
-
-
-
-
-# ========================
 # HAZARD GRID
 # ========================
 
@@ -247,15 +208,19 @@ def generate_hazard_grid(image_path: str, grid_size: int = GRID_SIZE) -> list[li
 
 
    grid = []
+
+
    for i in range(grid_size):
        row = []
-       y0  = (i       * height) // grid_size
-       y1  = ((i + 1) * height) // grid_size
+       y0 = (i * height) // grid_size
+       y1 = ((i + 1) * height) // grid_size
 
 
        for j in range(grid_size):
-           x0   = (j       * width) // grid_size
-           x1   = ((j + 1) * width) // grid_size
+           x0 = (j * width) // grid_size
+           x1 = ((j + 1) * width) // grid_size
+
+
            cell = img[y0:y1, x0:x1]
 
 
@@ -267,6 +232,8 @@ def generate_hazard_grid(image_path: str, grid_size: int = GRID_SIZE) -> list[li
 
 
            row.append(score)
+
+
        grid.append(row)
 
 
@@ -280,6 +247,8 @@ def print_hazard_grid(grid: list[list[int]] | None) -> None:
    if grid is None:
        print("[GRID] No grid to display")
        return
+
+
    print("[GRID] Hazard Grid:")
    for row in grid:
        print(" ".join(f"{cell:2d}" for cell in row))
@@ -299,16 +268,14 @@ def overlay_hazard_grid_on_image(
    grid_size: int = GRID_SIZE,
 ) -> bool:
    """
-   Draw a colour-coded hazard grid overlay on the image and save it.
+   Draw a colour-coded hazard grid on top of the captured image,
+   save it to the Annotated/ folder, and display it locally for 5 seconds.
 
 
-   Colour mapping (via score_to_bgr):
-     score 0  -> soft green
-     score 10 -> red
-
-
-   The colour layer is blended at 55% opacity so the image remains visible
-   while the overlay is still easy to interpret.
+   Colour key (BGR):
+     Green  = safe       score 7-10
+     Yellow = caution    score 4-6
+     Red    = hazardous  score 0-3
    """
    print("[OVERLAY] Creating annotated image...")
 
@@ -320,55 +287,113 @@ def overlay_hazard_grid_on_image(
 
 
    height, width = img.shape[:2]
-   colour_layer = img.copy()
+   overlay = img.copy()    # receives the solid colour fills
+   base    = img.copy()    # receives the grid borders and text
 
 
-   cell_w = max(1, width  // grid_size)
-   cell_h = max(1, height // grid_size)
-
-
-   font        = cv2.FONT_HERSHEY_SIMPLEX
-   font_scale  = min(0.38, max(0.13, (min(cell_w, cell_h) - 3) / 22.0))
-   draw_labels = (cell_w >= 14 and cell_h >= 14)
+   font       = cv2.FONT_HERSHEY_SIMPLEX
+   font_scale = 0.5
+   thickness  = 1
 
 
    for i in range(grid_size):
-       y0 = (i       * height) // grid_size
+       y0 = (i * height) // grid_size
        y1 = ((i + 1) * height) // grid_size
 
 
        for j in range(grid_size):
-           x0    = (j       * width) // grid_size
-           x1    = ((j + 1) * width) // grid_size
+           x0 = (j * width) // grid_size
+           x1 = ((j + 1) * width) // grid_size
+
+
            score = grid[i][j]
-           color = score_to_bgr(score)
 
 
-           cv2.rectangle(colour_layer, (x0, y0), (x1, y1), color, -1)
-           cv2.rectangle(colour_layer, (x0, y0), (x1, y1), (40, 40, 40), 1)
+           # Colour by safety band (BGR)
+           if score >= 7:
+               color = (34, 197, 94)       # green
+           elif score >= 4:
+               color = (50, 200, 234)      # yellow
+           else:
+               color = (68, 68, 239)       # red
 
 
-           if draw_labels:
-               text        = str(score)
-               (tw, th), _ = cv2.getTextSize(text, font, font_scale, 1)
-               tx          = x0 + ((x1 - x0) - tw) // 2
-               ty          = y0 + ((y1 - y0) + th) // 2
-               cv2.putText(
-                   colour_layer, text, (tx + 1, ty + 1),
-                   font, font_scale, (0, 0, 0), 2, cv2.LINE_AA
-               )
-               cv2.putText(
-                   colour_layer, text, (tx, ty),
-                   font, font_scale, (255, 255, 255), 1, cv2.LINE_AA
-               )
+           # Solid fill on the overlay layer
+           cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
 
 
-   annotated = cv2.addWeighted(colour_layer, 0.55, img, 0.45, 0)
+           # White cell border on the base layer
+           cv2.rectangle(base, (x0, y0), (x1, y1), (255, 255, 255), 1)
+
+
+           # Score label centred in cell — drop shadow then white text
+           text = str(score)
+           (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+           tx = x0 + ((x1 - x0) - tw) // 2
+           ty = y0 + ((y1 - y0) + th) // 2
+
+
+           cv2.putText(base, text, (tx + 1, ty + 1),
+                       font, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+           cv2.putText(base, text, (tx, ty),
+                       font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+   # Blend: 30% colour overlay, 70% original + borders/text
+   alpha     = 0.30
+   annotated = cv2.addWeighted(overlay, alpha, base, 1 - alpha, 0)
+
+
+   # ---- LEGEND (bottom-left corner) ----
+   legend_items = [
+       ("SAFE   (7-10)", (34, 197, 94)),
+       ("CAUTION(4-6) ", (50, 200, 234)),
+       ("HAZARD (0-3) ", (68, 68, 239)),
+   ]
+   swatch      = 28
+   row_height  = 44
+   leg_x       = 10
+   leg_y       = height - (len(legend_items) * row_height + 20)
+   lg_scale    = max(0.55, width / 1600)
+
+
+   for idx, (label, color) in enumerate(legend_items):
+       ly = leg_y + idx * row_height
+       cv2.rectangle(annotated, (leg_x, ly),
+                     (leg_x + swatch, ly + swatch), (255, 255, 255), 2)
+       cv2.rectangle(annotated, (leg_x, ly),
+                     (leg_x + swatch, ly + swatch), color, -1)
+       tx2 = leg_x + swatch + 8
+       ty2 = ly + swatch - 4
+       cv2.putText(annotated, label, (tx2 + 1, ty2 + 1),
+                   font, lg_scale, (0, 0, 0), 2)
+       cv2.putText(annotated, label, (tx2, ty2),
+                   font, lg_scale, (255, 255, 255), 1)
+
+
+   # ---- TITLE BAR (top-left corner) ----
+   title = "LUNAR HAZARD MAP"
+   (ttw, tth), _ = cv2.getTextSize(title, font, lg_scale * 1.2, 2)
+   cv2.rectangle(annotated, (0, 0), (ttw + 20, tth + 16), (0, 0, 0), -1)
+   cv2.putText(annotated, title, (10, tth + 8),
+               font, lg_scale * 1.2, (255, 255, 255), 2)
 
 
    try:
        cv2.imwrite(output_path, annotated)
        print(f"[OVERLAY] Annotated image saved -> {output_path}")
+
+
+       # Display locally only if a screen is connected
+       import os
+       if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+           cv2.imshow("Lunar Hazard Map", annotated)
+           cv2.waitKey(5000)
+           cv2.destroyAllWindows()
+       else:
+           print("[OVERLAY] No display detected — skipping local preview")
+
+
        return True
    except Exception as e:
        print(f"[ERROR] Failed to save annotated image: {e}")
@@ -394,14 +419,14 @@ def save_metadata(
 
 
    data = {
-       "timestamp":            timestamp(),
-       "image_path":           image_path,
+       "timestamp": timestamp(),
+       "image_path": image_path,
        "annotated_image_path": annotated_path,
        "acceleration_m_s2": {
-           "x":              round(accel[0], 6),
-           "y":              round(accel[1], 6),
-           "z":              round(accel[2], 6),
-           "magnitude":      round(magnitude, 6),
+           "x": round(accel[0], 6),
+           "y": round(accel[1], 6),
+           "z": round(accel[2], 6),
+           "magnitude": round(magnitude, 6),
            "gravity_offset": round(abs(magnitude - GRAVITY), 6),
        },
        "orientation": orientation,
@@ -419,44 +444,7 @@ def save_metadata(
 
 
 
-# ========================
-# GITHUB UPLOAD
-# ========================
-
-
-def upload_to_github(files_to_upload: list[str], commit_message: str) -> None:
-   if not ENABLE_GITHUB_UPLOAD:
-       print("[GIT] Upload disabled")
-       return
-
-
-   try:
-       repo = Repo(str(REPO_PATH))
-       repo.index.add(files_to_upload)
-
-
-       if repo.is_dirty(untracked_files=True):
-           repo.index.commit(commit_message)
-           remote = repo.remote(name=GITHUB_REMOTE_NAME)
-           remote.push(refspec=f"{GITHUB_BRANCH}:{GITHUB_BRANCH}")
-           print("[GIT] Upload successful")
-       else:
-           print("[GIT] No changes detected")
-
-
-   except Exception as e:
-       print(f"[GIT ERROR] {e}")
-
-
-
-
-def print_event_summary(
-   accel,
-   orientation,
-   image_path,
-   annotated_path,
-   data_path,
-) -> None:
+def print_event_summary(accel, orientation, image_path, annotated_path, data_path) -> None:
    magnitude = math.sqrt(accel[0]**2 + accel[1]**2 + accel[2]**2)
 
 
@@ -471,6 +459,39 @@ def print_event_summary(
        f"pitch={orientation['pitch_deg']:.3f}, "
        f"yaw={orientation['yaw_deg']:.3f}"
    )
+
+
+
+
+# ========================
+# GITHUB UPLOAD
+# ========================
+
+
+def upload_to_github(files_to_upload: list[str], commit_message: str) -> None:
+   if not ENABLE_GITHUB_UPLOAD:
+       print("[GIT] Upload disabled")
+       return
+
+
+   try:
+       repo = Repo(str(REPO_PATH))
+
+
+       repo.index.add(files_to_upload)
+
+
+       if repo.is_dirty(untracked_files=True):
+           repo.index.commit(commit_message)
+           remote = repo.remote(name=GITHUB_REMOTE_NAME)
+           remote.push(refspec=f"{GITHUB_BRANCH}:{GITHUB_BRANCH}")
+           print("[GIT] Upload successful")
+       else:
+           print("[GIT] No changes detected, skipping push")
+
+
+   except Exception as e:
+       print(f"[GIT ERROR] {e}")
 
 
 
@@ -494,7 +515,7 @@ def handle_capture_cycle(picam2, accel_gyro, magnetometer) -> None:
 
    capture_ok = capture_image(picam2, image_path)
    if not capture_ok:
-       print("[CYCLE] Capture cycle failed\n")
+       print("[CYCLE] Capture cycle failed — image not saved\n")
        return
 
 
@@ -515,36 +536,13 @@ def handle_capture_cycle(picam2, accel_gyro, magnetometer) -> None:
    )
 
 
-   if not overlay_ok:
-       print("[CYCLE] Overlay generation failed\n")
-       return
+   save_metadata(data_path, accel, orientation, grid, image_path, annotated_path)
+   print_event_summary(accel, orientation, image_path, annotated_path, data_path)
 
 
-   save_metadata(
-       filepath=data_path,
-       accel=accel,
-       orientation=orientation,
-       grid=grid,
-       image_path=image_path,
-       annotated_path=annotated_path,
-   )
-
-
-   print_event_summary(
-       accel,
-       orientation,
-       image_path,
-       annotated_path,
-       data_path,
-   )
-
-
-   files_to_commit = [image_path, annotated_path, data_path]
-
-
-   if COMMIT_EVERY_CAPTURE:
+   if overlay_ok and COMMIT_EVERY_CAPTURE:
        upload_to_github(
-           files_to_upload=files_to_commit,
+           files_to_upload=[image_path, annotated_path, data_path],
            commit_message=f"CubeSat capture {timestamp()}",
        )
 
@@ -576,6 +574,8 @@ def mission_loop(picam2, accel_gyro, magnetometer) -> None:
 
        elapsed    = time.time() - cycle_start
        sleep_time = max(0.0, CAPTURE_INTERVAL - elapsed)
+
+
        print(f"[WAIT] Sleeping for {sleep_time:.2f} seconds...\n")
        time.sleep(sleep_time)
 
