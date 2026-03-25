@@ -210,6 +210,72 @@ def print_hazard_grid(grid: list[list[int]] | None) -> None:
 
 
 # ========================
+# ROUTE FINDING
+# ========================
+
+def find_safest_route(grid: list[list[int]], grid_size: int = GRID_SIZE) -> list[tuple[int, int]]:
+    """
+    Use Dijkstra's algorithm to find the safest route for the rover
+    from any cell in the top row to any cell in the bottom row.
+
+    Cost of each cell = (10 - score), so high-score (safe) cells are
+    cheap to travel through and low-score (hazardous) cells are expensive.
+
+    Returns a list of (row, col) tuples representing the optimal path.
+    """
+    import heapq
+
+    # cost[i][j] = best total cost found so far to reach cell (i, j)
+    INF  = float("inf")
+    cost = [[INF] * grid_size for _ in range(grid_size)]
+    prev = [[None] * grid_size for _ in range(grid_size)]
+
+    # Priority queue entries: (cumulative_cost, row, col)
+    heap = []
+
+    # Seed from every cell in the top row
+    for col in range(grid_size):
+        cell_cost = 10 - grid[0][col]
+        cost[0][col] = cell_cost
+        heapq.heappush(heap, (cell_cost, 0, col))
+
+    # Allowed moves: down, left, right, diagonal-down-left, diagonal-down-right
+    # (no upward moves — rover travels top to bottom)
+    moves = [(1, 0), (0, -1), (0, 1), (1, -1), (1, 1)]
+
+    while heap:
+        curr_cost, r, c = heapq.heappop(heap)
+
+        if curr_cost > cost[r][c]:
+            continue  # stale entry
+
+        for dr, dc in moves:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < grid_size and 0 <= nc < grid_size:
+                new_cost = curr_cost + (10 - grid[nr][nc])
+                if new_cost < cost[nr][nc]:
+                    cost[nr][nc] = new_cost
+                    prev[nr][nc] = (r, c)
+                    heapq.heappush(heap, (new_cost, nr, nc))
+
+    # Find the best (lowest cost) cell in the bottom row
+    best_col = min(range(grid_size), key=lambda c: cost[grid_size - 1][c])
+
+    # Reconstruct path by walking backwards through prev[][]
+    path = []
+    node = (grid_size - 1, best_col)
+    while node is not None:
+        path.append(node)
+        r, c = node
+        node = prev[r][c]
+
+    path.reverse()
+    print(f"[ROUTE] Safest route found: {len(path)} cells, "
+          f"total hazard cost = {cost[grid_size - 1][best_col]:.1f}")
+    return path
+
+
+# ========================
 # IMAGE OVERLAY
 # ========================
 
@@ -220,17 +286,15 @@ def overlay_hazard_grid_on_image(
     grid_size: int = GRID_SIZE,
 ) -> bool:
     """
-    Draw a colour-coded hazard grid on top of the captured image and save it
-    to the Annotated/ folder.
+    Draw a colour-coded hazard grid on top of the captured image,
+    then draw the safest rover route as highlighted cells + a bright
+    line through their centres. Saves result to the Annotated/ folder.
 
     Colour key (BGR):
-      Green  (0, 255,   0) = safe       score 7-10
-      Yellow (0, 255, 255) = caution    score 4-6
-      Red    (0,   0, 255) = hazardous  score 0-3
-
-    A semi-transparent fill (alpha=0.30) lets the terrain beneath show through.
-    Each cell also prints its numeric score in white with a black drop-shadow
-    so it is readable on any background.
+      Green  = safe       score 7-10
+      Yellow = caution    score 4-6
+      Red    = hazardous  score 0-3
+      Cyan   = safest rover route
     """
     print("[OVERLAY] Creating annotated image...")
 
@@ -240,12 +304,17 @@ def overlay_hazard_grid_on_image(
         return False
 
     height, width = img.shape[:2]
-    overlay = img.copy()           # receives the solid colour fills
-    base    = img.copy()           # receives the grid borders and text
+    overlay = img.copy()    # receives the solid colour fills
+    base    = img.copy()    # receives grid borders, text, and route line
 
     font       = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     thickness  = 1
+
+    # Compute safest route first so we can highlight those cells differently
+    route      = find_safest_route(grid, grid_size)
+    route_set  = set(route)
+    ROUTE_COLOR = (255, 220, 0)   # cyan-white (BGR) for route cell highlight
 
     for i in range(grid_size):
         y0 = (i * height) // grid_size
@@ -265,13 +334,19 @@ def overlay_hazard_grid_on_image(
             else:
                 color = (68, 68, 239)       # red
 
+            # Route cells get a bright cyan-white highlight instead
+            if (i, j) in route_set:
+                color = ROUTE_COLOR
+
             # Solid fill on the overlay layer
             cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
 
-            # White cell border on the base layer
-            cv2.rectangle(base, (x0, y0), (x1, y1), (255, 255, 255), 1)
+            # Cell border — thicker white for route cells
+            border_thickness = 3 if (i, j) in route_set else 1
+            cv2.rectangle(base, (x0, y0), (x1, y1),
+                          (255, 255, 255), border_thickness)
 
-            # Score label centred in cell — drop shadow then white text
+            # Score label centred in cell
             text = str(score)
             (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
             tx = x0 + ((x1 - x0) - tw) // 2
@@ -283,14 +358,46 @@ def overlay_hazard_grid_on_image(
                         font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     # Blend: 30 % colour overlay, 70 % original + borders/text
-    alpha     = 0.30
+    alpha     = 0.35
     annotated = cv2.addWeighted(overlay, alpha, base, 1 - alpha, 0)
+
+    # ---- DRAW ROUTE LINE through cell centres ----
+    cell_h = height // grid_size
+    cell_w = width  // grid_size
+
+    route_points = []
+    for (r, c) in route:
+        cx = (c * cell_w) + cell_w // 2
+        cy = (r * cell_h) + cell_h // 2
+        route_points.append((cx, cy))
+
+    # Draw a thick dark outline first, then the bright line on top
+    for k in range(len(route_points) - 1):
+        cv2.line(annotated, route_points[k], route_points[k + 1],
+                 (0, 0, 0), 6, cv2.LINE_AA)                    # black outline
+    for k in range(len(route_points) - 1):
+        cv2.line(annotated, route_points[k], route_points[k + 1],
+                 (255, 220, 0), 3, cv2.LINE_AA)                 # bright cyan line
+
+    # Draw start (S) and end (E) markers
+    if route_points:
+        cv2.circle(annotated, route_points[0],  10, (0, 0, 0),       -1)
+        cv2.circle(annotated, route_points[0],  10, (255, 220, 0),    2)
+        cv2.circle(annotated, route_points[-1], 10, (0, 0, 0),       -1)
+        cv2.circle(annotated, route_points[-1], 10, (255, 220, 0),    2)
+
+        s_scale = max(0.4, cell_w / 80)
+        cv2.putText(annotated, "S", (route_points[0][0]  - 5, route_points[0][1]  + 5),
+                    font, s_scale, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(annotated, "E", (route_points[-1][0] - 5, route_points[-1][1] + 5),
+                    font, s_scale, (255, 255, 255), 2, cv2.LINE_AA)
 
     # ---- LEGEND (bottom-left corner) ----
     legend_items = [
         ("SAFE   (7-10)", (34, 197, 94)),
         ("CAUTION(4-6) ", (50, 200, 234)),
         ("HAZARD (0-3) ", (68, 68, 239)),
+        ("ROVER ROUTE  ", ROUTE_COLOR),
     ]
     swatch   = 18
     leg_x    = 10
@@ -311,7 +418,7 @@ def overlay_hazard_grid_on_image(
                     font, lg_scale, (255, 255, 255), 1)
 
     # ---- TITLE BAR (top-left corner) ----
-    title = "LUNAR HAZARD MAP"
+    title = "LUNAR HAZARD MAP + ROVER ROUTE"
     (ttw, tth), _ = cv2.getTextSize(title, font, lg_scale * 1.2, 2)
     cv2.rectangle(annotated, (0, 0), (ttw + 20, tth + 16), (0, 0, 0), -1)
     cv2.putText(annotated, title, (10, tth + 8),
